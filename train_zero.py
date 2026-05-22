@@ -129,7 +129,7 @@ def main():
     # 定义损失函数
     loss_focal = FocalLoss()                                                  # 像素级 Focal Loss
     loss_dice = BinaryDiceLoss()                                              # 像素级 Dice Loss
-    loss_bce = torch.nn.BCEWithLogitsLoss()                                   # 图像级二分类 BCE Loss（带 Logits）
+    loss_bce = torch.nn.BCELoss()                                             # 图像级 BCE Loss（输入为 softmax 概率）
 
     # 文本特征列表，初始化一个占位元素（索引 0 不用）
     text_feature_list = [0]
@@ -241,8 +241,9 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]  # [B, L]
                         # 对所有 patch 取平均，得到图像级异常分数
                         anomaly_score = torch.mean(anomaly_map, dim=-1)  # [B]
-                        # 计算 BCE loss
-                        det_loss += loss_bce(anomaly_score, image_label)
+                        # 数值保护 + 标签对齐，计算 BCE loss
+                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
+                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
                     else:
                         # ===== 欧氏模式（原版 MVFA）=====
                         # L2 归一化特征，便于与文本特征做余弦相似度
@@ -253,8 +254,9 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         # 对所有 patch 取平均，得到图像级异常分数，形状 [B]
                         anomaly_score = torch.mean(anomaly_map, dim=-1)
-                        # BCEWithLogitsLoss 期望输入为 logits，此处 anomaly_score 已是概率，仍按原代码使用
-                        det_loss += loss_bce(anomaly_score, image_label)
+                        # 数值保护 + 标签对齐，计算 BCE loss
+                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
+                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
 
                 # seg_idx > 0 表示该任务有像素级标注（如 Retina_RESC, Liver, Brain 等）
                 if seg_idx > 0:
@@ -357,6 +359,22 @@ def main():
         
 
 
+
+def normalize_map_per_image(x, eps=1e-8):
+    """Per-image min-max normalization over spatial dimensions (numpy array)."""
+    if x.ndim == 2:
+        x_min = x.min(keepdims=True)
+        x_max = x.max(keepdims=True)
+    elif x.ndim == 3:
+        x_min = x.min(axis=(1, 2), keepdims=True)
+        x_max = x.max(axis=(1, 2), keepdims=True)
+    elif x.ndim == 4:
+        x_min = x.min(axis=(1, 2, 3), keepdims=True)
+        x_max = x.max(axis=(1, 2, 3), keepdims=True)
+    else:
+        raise ValueError(f"Unsupported map shape: {x.shape}")
+    return (x - x_min) / (x_max - x_min + eps)
+
 def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.0):
     """
     在测试集上评估模型的图像级 AUC 和像素级 AUC（若有分割标注）
@@ -429,7 +447,8 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         # 对所有 patch 求平均，累加到 anomaly_score
                         anomaly_score += anomaly_map.mean()
-                # 将图像级分数拷回 CPU，加入列表
+                # 多层平均：除以层数后存入列表
+                anomaly_score = anomaly_score / len(patch_tokens)
                 image_scores.append(anomaly_score.cpu())
 
                 # 像素级分数计算
@@ -480,8 +499,8 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
                         anomaly_map = torch.softmax(anomaly_map, dim=1)[:, 1, :, :]
                         # 转为 numpy 并加入 list
                         anomaly_maps.append(anomaly_map.cpu().numpy())
-                # 将不同层的 anomaly map 按通道相加，得到最终像素级 score map
-                final_score_map = np.sum(anomaly_maps, axis=0)
+                # 将不同层的 anomaly map 取均值，得到最终像素级 score map
+                final_score_map = np.mean(anomaly_maps, axis=0)
                 
                 # 收集当前样本的 GT mask（转为 numpy）、图像级 GT y 和像素级预测 score map
                 gt_mask_list.append(mask[batch_idx].squeeze().cpu().detach().numpy())
@@ -496,8 +515,8 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
     segment_scores = np.array(segment_scores)              # 像素级预测分数数组
     image_scores = np.array(image_scores)                  # 图像级预测分数数组
 
-    # 将像素级与图像级分数都归一化到 [0, 1] 区间，便于计算 ROC AUC
-    segment_scores = (segment_scores - segment_scores.min()) / (segment_scores.max() - segment_scores.min())
+    # 像素级逐图归一化，图像级全局归一化
+    segment_scores = normalize_map_per_image(segment_scores)
     image_scores = (image_scores - image_scores.min()) / (image_scores.max() - image_scores.min())
 
     # 图像级 ROC AUC（检测）

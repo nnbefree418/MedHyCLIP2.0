@@ -149,6 +149,22 @@ def main():
              args.temperature)
 
 
+
+def normalize_map_per_image(x, eps=1e-8):
+    """Per-image min-max normalization over spatial dimensions (numpy array)."""
+    if x.ndim == 2:
+        x_min = x.min(keepdims=True)
+        x_max = x.max(keepdims=True)
+    elif x.ndim == 3:
+        x_min = x.min(axis=(1, 2), keepdims=True)
+        x_max = x.max(axis=(1, 2), keepdims=True)
+    elif x.ndim == 4:
+        x_min = x.min(axis=(1, 2, 3), keepdims=True)
+        x_max = x.max(axis=(1, 2, 3), keepdims=True)
+    else:
+        raise ValueError(f"Unsupported map shape: {x.shape}")
+    return (x - x_min) / (x_max - x_min + eps)
+
 def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.0):
     """
     在测试集上评估 zero-shot 模型
@@ -191,6 +207,7 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
                         anomaly_map = (100.0 * patch_tokens[layer] @ text_features).unsqueeze(0)
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         anomaly_score += anomaly_map.mean()
+                anomaly_score = anomaly_score / len(patch_tokens)
                 image_scores.append(anomaly_score.cpu())
 
                 # ------------------ 像素级分数 ------------------
@@ -226,7 +243,7 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
                         )
                         anomaly_map = torch.softmax(anomaly_map, dim=1)[:, 1, :, :]
                         anomaly_maps.append(anomaly_map.cpu().numpy())
-                final_score_map = np.sum(anomaly_maps, axis=0)
+                final_score_map = np.mean(anomaly_maps, axis=0)
                 
                 gt_mask_list.append(mask[batch_idx].squeeze().cpu().detach().numpy())
                 gt_list.extend(y[batch_idx:batch_idx+1].cpu().detach().numpy())
@@ -239,7 +256,7 @@ def test(args, seg_model, test_loader, text_features, ball=None, temperature=20.
     segment_scores = np.array(segment_scores)
     image_scores = np.array(image_scores)
 
-    segment_scores = (segment_scores - segment_scores.min()) / (segment_scores.max() - segment_scores.min())
+    segment_scores = normalize_map_per_image(segment_scores)
     image_scores = (image_scores - image_scores.min()) / (image_scores.max() - image_scores.min())
 
     img_roc_auc_det = roc_auc_score(gt_list, image_scores)

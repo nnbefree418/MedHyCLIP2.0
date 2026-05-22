@@ -143,7 +143,7 @@ def main():
     # 定义损失函数：像素级 Focal + Dice，用于分割；BCEWithLogits 用于图像级分类
     loss_focal = FocalLoss()  # 像素级 Focal Loss
     loss_dice = BinaryDiceLoss()  # 像素级 Dice Loss
-    loss_bce = torch.nn.BCEWithLogitsLoss()  # 图像级二分类 BCE Loss（带 Logits）
+    loss_bce = torch.nn.BCELoss()  # 图像级 BCE Loss（输入为 softmax 概率）
 
 
     # 编码文本 prompt，得到该任务对应的文本特征（形状 [dim, 2]）
@@ -212,8 +212,9 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]  # [B, L]
                         # 对所有 patch 取平均，得到图像级异常分数
                         anomaly_score = torch.mean(anomaly_map, dim=-1)  # [B]
-                        # 计算 BCE loss
-                        det_loss += loss_bce(anomaly_score, image_label)
+                        # 数值保护 + 标签对齐，计算 BCE loss
+                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
+                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
                     else:
                         # ===== 欧氏模式（原版 MVFA）=====
                         # L2 归一化 patch 特征
@@ -224,8 +225,9 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         # 对所有 patch 平均得到图像级异常分数，形状 [B]
                         anomaly_score = torch.mean(anomaly_map, dim=-1)
-                        # 使用 BCEWithLogitsLoss 计算图像级损失（原始代码将概率直接作为 logits 输入，保持不改）
-                        det_loss += loss_bce(anomaly_score, image_label)
+                        # 数值保护 + 标签对齐，计算 BCE loss
+                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
+                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
 
                 # 若该任务有像素级标注（CLASS_INDEX > 0），则训练分割头
                 if CLASS_INDEX[args.obj] > 0:
@@ -354,6 +356,22 @@ def main():
           
 
 
+
+def normalize_map_per_image(x, eps=1e-8):
+    """Per-image min-max normalization over spatial dimensions (numpy array)."""
+    if x.ndim == 2:
+        x_min = x.min(keepdims=True)
+        x_max = x.max(keepdims=True)
+    elif x.ndim == 3:
+        x_min = x.min(axis=(1, 2), keepdims=True)
+        x_max = x.max(axis=(1, 2), keepdims=True)
+    elif x.ndim == 4:
+        x_min = x.min(axis=(1, 2, 3), keepdims=True)
+        x_max = x.max(axis=(1, 2, 3), keepdims=True)
+    else:
+        raise ValueError(f"Unsupported map shape: {x.shape}")
+    return (x - x_min) / (x_max - x_min + eps)
+
 def test(args, model, test_loader, text_features, seg_mem_features, det_mem_features, ball=None, temperature=1.0):
     """
     few-shot 测试：
@@ -392,8 +410,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                         # 双曲 few-shot：用 hyperbolic_distance_batch
                         dist = hyperbolic_distance_batch(seg_mem_features[idx], p, ball)  # [N_mem, L]
                         height = int(np.sqrt(dist.shape[1]))
-                        # 距离越大越异常，取最大距离，应用温度系数缩放
-                        anomaly_map_few_shot = torch.max(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
+                        # 取最近邻（最小距离）作为异常分数
+                        anomaly_map_few_shot = torch.min(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
                         anomaly_map_few_shot = F.interpolate(
                             anomaly_map_few_shot,
                             size=args.img_size,
@@ -462,7 +480,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                         anomaly_map = torch.softmax(anomaly_map, dim=1)[0, 1, :, :]  # 取第 0 个 batch
                         anomaly_maps.append(anomaly_map.cpu().numpy())
 
-                score_map_zero = np.sum(anomaly_maps, axis=0)
+                score_map_zero = np.mean(anomaly_maps, axis=0)
                 seg_score_map_zero.append(score_map_zero)
 
             # ======================= 只有图像级标注：检测头 =======================
@@ -473,8 +491,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                     if args.use_hyperbolic:
                         dist = hyperbolic_distance_batch(det_mem_features[idx], p, ball)  # [N_mem, L]
                         height = int(np.sqrt(dist.shape[1]))
-                        # 应用温度系数缩放距离
-                        anomaly_map_few_shot = torch.max(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
+                        # 取最近邻（最小距离）作为异常分数
+                        anomaly_map_few_shot = torch.min(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
                         anomaly_map_few_shot = F.interpolate(
                             anomaly_map_few_shot,
                             size=args.img_size,
@@ -524,6 +542,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         anomaly_score += anomaly_map.mean()
 
+                anomaly_score = anomaly_score / len(det_patch_tokens)
                 det_image_scores_zero.append(anomaly_score.cpu().numpy())
 
         # ===== 每个 batch（这里就是一张图）收集 GT =====
@@ -543,12 +562,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
         if seg_score_map_few.ndim == 4:  # (N, 1, H, W) -> (N, H, W)
             seg_score_map_few = seg_score_map_few.squeeze(1)
 
-        seg_score_map_zero = (seg_score_map_zero - seg_score_map_zero.min()) / (
-            seg_score_map_zero.max() - seg_score_map_zero.min() + 1e-8
-        )
-        seg_score_map_few = (seg_score_map_few - seg_score_map_few.min()) / (
-            seg_score_map_few.max() - seg_score_map_few.min() + 1e-8
-        )
+        seg_score_map_zero = normalize_map_per_image(seg_score_map_zero)
+        seg_score_map_few = normalize_map_per_image(seg_score_map_few)
 
         segment_scores = 0.5 * seg_score_map_zero + 0.5 * seg_score_map_few
         seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())

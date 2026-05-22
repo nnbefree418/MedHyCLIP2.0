@@ -155,7 +155,7 @@ def main():
     # 定义损失函数（本脚本不会反向更新，只是与 train_few 保持一致）
     loss_focal = FocalLoss()  # 像素级 Focal Loss
     loss_dice = BinaryDiceLoss()  # 像素级 Dice Loss
-    loss_bce = torch.nn.BCEWithLogitsLoss()  # 图像级 BCEWithLogitsLoss
+    loss_bce = torch.nn.BCELoss()  # 图像级 BCE Loss（输入为概率）
 
 
     # 文本 prompt 编码：得到该任务对应的文本特征（[dim, 2]）
@@ -185,9 +185,9 @@ def main():
         image = image[0].to(device)  # support_loader 返回 (img,)，取出第 0 个元素
         with torch.no_grad():  # 构建 memory bank 不需要梯度
             _, seg_patch_tokens, det_patch_tokens = model(image)
-            # 每层 seg_patch_tokens 形状 [1, L+1, C]，这里保留全部 token（包含 CLS）
-            seg_patch_tokens = [p[0].contiguous() for p in seg_patch_tokens]
-            det_patch_tokens = [p[0].contiguous() for p in det_patch_tokens]
+            # 每层 seg_patch_tokens 形状 [1, L+1, C]，去掉 CLS token（索引 0），只保留 patch tokens
+            seg_patch_tokens = [p[0, 1:, :].contiguous() for p in seg_patch_tokens]
+            det_patch_tokens = [p[0, 1:, :].contiguous() for p in det_patch_tokens]
             seg_features.append(seg_patch_tokens)  # 每个样本一个 list（按层）
             det_features.append(det_patch_tokens)
     # 对所有支持样本在“样本维度”上拼接，得到每层的 memory 特征
@@ -198,6 +198,22 @@ def main():
     # 调用 test 函数，在测试集上进行 zero-shot + few-shot 融合评估
     result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features, ball, args.temperature)
 
+
+
+def normalize_map_per_image(x, eps=1e-8):
+    """Per-image min-max normalization over spatial dimensions (numpy array)."""
+    if x.ndim == 2:
+        x_min = x.min(keepdims=True)
+        x_max = x.max(keepdims=True)
+    elif x.ndim == 3:
+        x_min = x.min(axis=(1, 2), keepdims=True)
+        x_max = x.max(axis=(1, 2), keepdims=True)
+    elif x.ndim == 4:
+        x_min = x.min(axis=(1, 2, 3), keepdims=True)
+        x_max = x.max(axis=(1, 2, 3), keepdims=True)
+    else:
+        raise ValueError(f"Unsupported map shape: {x.shape}")
+    return (x - x_min) / (x_max - x_min + eps)
 
 def test(args, model, test_loader, text_features, seg_mem_features, det_mem_features, ball=None, temperature=1.0):
     """
@@ -255,8 +271,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                             # ===== 双曲模式：使用向量化双曲距离 =====
                             dist = hyperbolic_distance_batch(seg_mem_features[idx], p, ball)  # [N_mem, L]
                             height = int(np.sqrt(dist.shape[1]))  # patch 数量 L = H*H
-                            # 距离越大越异常，取最大距离作为该 patch 的异常分数，应用温度系数缩放
-                            anomaly_map_few_shot = torch.max(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
+                            # 距离越小越正常，取最近邻（最小距离）作为该 patch 的异常分数，应用温度系数缩放
+                            anomaly_map_few_shot = torch.min(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
                             # 插值到原始图像大小
                             anomaly_map_few_shot = F.interpolate(anomaly_map_few_shot,
                                                                     size=args.img_size, mode='bilinear', align_corners=True)
@@ -271,7 +287,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                             anomaly_map_few_shot = F.interpolate(torch.tensor(anomaly_map_few_shot),
                                                                     size=args.img_size, mode='bilinear', align_corners=True)
                             anomaly_maps_few_shot.append(anomaly_map_few_shot[0].cpu().numpy())
-                    # 对所有层的 few-shot anomaly map 求和，得到最终 few-shot score map
+                    # 对所有层的 few-shot anomaly map 求和（few-shot 多层融合保持 sum）
                     score_map_few = np.sum(anomaly_maps_few_shot, axis=0)
                     seg_score_map_few.append(score_map_few)
 
@@ -321,8 +337,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                             anomaly_map = torch.softmax(anomaly_map, dim=1)[:, 1, :, :]
                             # 转 numpy 存入列表
                             anomaly_maps.append(anomaly_map.cpu().numpy())
-                    # 对所有层 zero-shot anomaly map 求和
-                    score_map_zero = np.sum(anomaly_maps, axis=0)
+                    # 对所有层 zero-shot anomaly map 取均值（多层平均融合）
+                    score_map_zero = np.mean(anomaly_maps, axis=0)
                     seg_score_map_zero.append(score_map_zero)
                 
 
@@ -339,8 +355,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                             # ===== 双曲模式：使用向量化双曲距离 =====
                             dist = hyperbolic_distance_batch(det_mem_features[idx], p, ball)  # [N_mem, L]
                             height = int(np.sqrt(dist.shape[1]))  # patch 网格大小 H
-                            # 距离越大越异常，取最大距离，应用温度系数缩放
-                            anomaly_map_few_shot = torch.max(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
+                            # 取最近邻（最小距离）作为该 patch 的异常分数，应用温度系数缩放
+                            anomaly_map_few_shot = torch.min(temperature * dist, dim=0)[0].reshape(1, 1, height, height)
                             anomaly_map_few_shot = F.interpolate(anomaly_map_few_shot,
                                                                     size=args.img_size, mode='bilinear', align_corners=True)
                             anomaly_maps_few_shot.append(anomaly_map_few_shot[0].cpu().numpy())
@@ -395,7 +411,8 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                             anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                             # 对所有 patch 求平均并累加
                             anomaly_score += anomaly_map.mean()
-                    # 保存 zero-shot 图像级得分（转 numpy）
+                    # 多层平均：除以层数，保存 zero-shot 图像级得分
+                    anomaly_score = anomaly_score / len(det_patch_tokens_single)
                     det_image_scores_zero.append(anomaly_score.cpu().numpy())
 
                 
@@ -416,9 +433,9 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
         seg_score_map_zero = np.array(seg_score_map_zero)  # [N, H, W]，zero-shot 得分图
         seg_score_map_few = np.array(seg_score_map_few)    # [N, H, W]，few-shot 得分图
 
-        # 对 zero-shot 与 few-shot 得分图分别做 min-max 归一化
-        seg_score_map_zero = (seg_score_map_zero - seg_score_map_zero.min()) / (seg_score_map_zero.max() - seg_score_map_zero.min())
-        seg_score_map_few = (seg_score_map_few - seg_score_map_few.min()) / (seg_score_map_few.max() - seg_score_map_few.min())
+        # 对 zero-shot 与 few-shot 得分图分别做逐图像 min-max 归一化
+        seg_score_map_zero = normalize_map_per_image(seg_score_map_zero)
+        seg_score_map_few = normalize_map_per_image(seg_score_map_few)
     
         # 融合像素级得分：0.5 * zero-shot + 0.5 * few-shot
         segment_scores = 0.5 * seg_score_map_zero + 0.5 * seg_score_map_few
