@@ -133,35 +133,21 @@ class CLIP_Inplanted(nn.Module):
                 
                 if self.use_hyperbolic:
                     # ===== 双曲模式 =====
-                    # x 当前是欧氏空间特征 [L+1, B, C]，需要投影到双曲空间
                     x_hyp = self.ball.expmap0(x)
-                    
-                    # 调用双曲 adapters（它们返回双曲空间的特征）
                     seg_adapt_med, seg_adapt_out = self.seg_adapters[adapter_idx](x_hyp)
                     det_adapt_med, det_adapt_out = self.det_adapters[adapter_idx](x_hyp)
-                    
-                    # 将双曲输出映射回切空间（欧氏），以便与主干 x 融合
                     seg_adapt_out_eucl = self.ball.logmap0(seg_adapt_out)
                     det_adapt_out_eucl = self.ball.logmap0(det_adapt_out)
-                    
-                    # 残差融合（在欧氏空间）：主干特征 x 与两个 adapter 输出按 0.8/0.1/0.1 加权相加
                     x = 0.8 * x + 0.1 * seg_adapt_out_eucl + 0.1 * det_adapt_out_eucl
-                    
-                    # 保存双曲空间的中间特征（用于后续 patch-level 推理）
                     seg_patch_tokens.append(seg_adapt_med)
                     det_patch_tokens.append(det_adapt_med)
                 else:
                     # ===== 欧氏模式（原版 MVFA）=====
-                # 根据当前层在 features 中的索引，选择对应 adapter
                     seg_adapt_med, seg_adapt_out = self.seg_adapters[adapter_idx](x)
                     det_adapt_med, det_adapt_out = self.det_adapters[adapter_idx](x)
-
-                # 残差融合：主干特征 x 与两个 adapter 输出按 0.8/0.1/0.1 加权相加
-                x = 0.8 * x + 0.1 * seg_adapt_out + 0.1 * det_adapt_out
-
-                # 保存 adapter 的中间特征（瓶颈输出，用于后续 patch-level 推理）
-                seg_patch_tokens.append(seg_adapt_med)
-                det_patch_tokens.append(det_adapt_med)
+                    x = 0.8 * x + 0.1 * seg_adapt_out + 0.1 * det_adapt_out
+                    seg_patch_tokens.append(seg_adapt_med)
+                    det_patch_tokens.append(det_adapt_med)
 
         # attn_out[0] 形状为 [B, num_heads, L, L]，这里 B, C, L 实际对应 [B, n_head, L]
         B, C, L = attn_out[0].shape
