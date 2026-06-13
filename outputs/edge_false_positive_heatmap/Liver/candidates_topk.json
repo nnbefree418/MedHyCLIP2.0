@@ -1,0 +1,57 @@
+[
+  {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 47112.6171875,
+    "edge_outside_mean": 0.2555074691772461,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 60188.12988270801,
+    "index": 187,
+    "label": 0,
+    "path": "./data/Liver_AD/test/good/img/2_431.png",
+    "is_normal": true
+  },
+  {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 43871.3125,
+    "edge_outside_mean": 0.23264247179031372,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 51031.65527334891,
+    "index": 188,
+    "label": 0,
+    "path": "./data/Liver_AD/test/good/img/2_433.png",
+    "is_normal": true
+  },
+  {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 42857.11328125,
+    "edge_outside_mean": 0.2317734658718109,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 49665.70800772628,
+    "index": 306,
+    "label": 0,
+    "path": "./data/Liver_AD/test/good/img/3_432.png",
+    "is_normal": true
+  },
+  {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 41985.6875,
+    "edge_outside_mean": 0.2222013622522354,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 46646.38671866902,
+    "index": 193,
+    "label": 0,
+    "path": "./data/Liver_AD/test/good/img/2_438.png",
+    "is_normal": true
+  },
+  {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 41344.2734375,
+    "edge_outside_mean": 0.22292733192443848,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 46083.84277335749,
+    "index": 305,
+    "label": 0,
+    "path": "./data/Liver_AD/test/good/img/3_431.png",
+    "is_normal": true
+  }
+]

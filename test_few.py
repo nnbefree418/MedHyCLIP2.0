@@ -75,6 +75,8 @@ def main():
     # ========= 新增：tag 参数，用于区分不同实验版本的 few-shot checkpoint =========
     parser.add_argument('--tag', type=str, default=None,
                         help='Optional tag for checkpoint naming, should match train_few.py')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='(unused in test, kept for CLI compatibility with train_few.py)')
     # ============================================================
     args = parser.parse_args()  # 解析命令行参数
 
@@ -430,8 +432,21 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     # 若当前任务有像素级标注，则基于分割头的 zero-shot + few-shot score map 计算 AUC
     if CLASS_INDEX[args.obj] > 0:
 
-        seg_score_map_zero = np.array(seg_score_map_zero)  # [N, H, W]，zero-shot 得分图
-        seg_score_map_few = np.array(seg_score_map_few)    # [N, H, W]，few-shot 得分图
+        seg_score_map_zero = np.array(seg_score_map_zero)  # zero-shot 得分图
+        seg_score_map_few = np.array(seg_score_map_few)    # few-shot 得分图
+
+        # 统一到 (N, H, W)，避免维度广播导致超大数组分配
+        def _to_nhw(x):
+            while x.ndim > 3 and x.shape[1] == 1:
+                x = np.squeeze(x, axis=1)
+            return x
+
+        seg_score_map_zero = _to_nhw(seg_score_map_zero)
+        seg_score_map_few = _to_nhw(seg_score_map_few)
+        if seg_score_map_zero.shape != seg_score_map_few.shape:
+            raise RuntimeError(
+                f"Shape mismatch before fusion: zero={seg_score_map_zero.shape}, few={seg_score_map_few.shape}"
+            )
 
         # 对 zero-shot 与 few-shot 得分图分别做逐图像 min-max 归一化
         seg_score_map_zero = normalize_map_per_image(seg_score_map_zero)

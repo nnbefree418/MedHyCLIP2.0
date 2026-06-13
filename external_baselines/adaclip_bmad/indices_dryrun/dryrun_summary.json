@@ -1,0 +1,15 @@
+[
+  {
+    "source_datasets": [
+      "his",
+      "chestxray",
+      "oct17",
+      "liverct",
+      "resc"
+    ],
+    "source_train": 20,
+    "source_val": 10,
+    "target": "brainmri",
+    "target_test": 8
+  }
+]

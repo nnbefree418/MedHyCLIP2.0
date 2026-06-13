@@ -76,6 +76,8 @@ def main():
     # ========= 新增：tag，用于区分不同实验版本的 checkpoint =========
     parser.add_argument('--tag', type=str, default=None,
                         help='Optional tag for checkpoint naming, should match few-shot test script')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience (epochs without improvement before stopping)')
     # ============================================================
     args = parser.parse_args()  # 解析命令行参数
 
@@ -165,6 +167,7 @@ def main():
             ball = None
 
     best_result = 0  # 记录最优结果，用于选择最好的 checkpoint
+    no_improve_epochs = 0  # early stopping 计数器：记录连续未提升的 epoch 数
 
     # 开始训练多个 epoch
     for epoch in range(args.epoch):
@@ -212,9 +215,10 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]  # [B, L]
                         # 对所有 patch 取平均，得到图像级异常分数
                         anomaly_score = torch.mean(anomaly_map, dim=-1)  # [B]
-                        # 数值保护 + 标签对齐，计算 BCE loss
-                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
-                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
+                        # 数值保护，转 fp32（BCELoss 在 autocast 块内无条件报错，需在 autocast(enabled=False) 里调用）
+                        anomaly_score = anomaly_score.float().clamp(1e-6, 1.0 - 1e-6)
+                        with torch.cuda.amp.autocast(enabled=False):
+                            det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
                     else:
                         # ===== 欧氏模式（原版 MVFA）=====
                         # L2 归一化 patch 特征
@@ -225,9 +229,10 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         # 对所有 patch 平均得到图像级异常分数，形状 [B]
                         anomaly_score = torch.mean(anomaly_map, dim=-1)
-                        # 数值保护 + 标签对齐，计算 BCE loss
-                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
-                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
+                        # 数值保护，转 fp32
+                        anomaly_score = anomaly_score.float().clamp(1e-6, 1.0 - 1e-6)
+                        with torch.cuda.amp.autocast(enabled=False):
+                            det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
 
                 # 若该任务有像素级标注（CLASS_INDEX > 0），则训练分割头
                 if CLASS_INDEX[args.obj] > 0:
@@ -337,10 +342,11 @@ def main():
 
         # 在测试集上评估当前模型性能（zero-shot + few-shot 结合）
         result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features, ball, args.temperature)
-        if result > best_result:
+        if result >= best_result:
             # 若结果优于历史最优，则更新 best_result，并根据需要保存模型
             best_result = result
-            print("Best result\n")
+            no_improve_epochs = 0
+            print(f'[EarlyStopping] Epoch {epoch}: score improved to {round(result, 4)}')
             if args.save_model == 1:
                 # ========= 按照是否有 tag 决定保存的 ckpt 文件名 =========
                 if args.tag is None:
@@ -353,7 +359,13 @@ def main():
                 torch.save({'seg_adapters': model.seg_adapters.state_dict(),     # 保存分割适配器参数
                             'det_adapters': model.det_adapters.state_dict()},    # 保存检测适配器参数
                             ckp_path)
-          
+        else:
+            no_improve_epochs += 1
+            print(f'[EarlyStopping] Epoch {epoch}: no improvement ({no_improve_epochs}/{args.patience}), best={round(best_result, 4)}')
+            if no_improve_epochs >= args.patience:
+                print(f'[EarlyStopping] Patience {args.patience} reached, stopping early at epoch {epoch}.')
+                break
+
 
 
 
@@ -557,10 +569,19 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     if CLASS_INDEX[args.obj] > 0:
         seg_score_map_zero = np.array(seg_score_map_zero)
         seg_score_map_few = np.array(seg_score_map_few)
-        
-        # 确保形状一致：去掉多余的维度
-        if seg_score_map_few.ndim == 4:  # (N, 1, H, W) -> (N, H, W)
-            seg_score_map_few = seg_score_map_few.squeeze(1)
+
+        # 统一到 (N, H, W)，避免 (N,1,H,W) 与 (N,H,W) 广播成 (N,N,H,W) 导致内存爆炸
+        def _to_nhw(x):
+            while x.ndim > 3 and x.shape[1] == 1:
+                x = np.squeeze(x, axis=1)
+            return x
+
+        seg_score_map_zero = _to_nhw(seg_score_map_zero)
+        seg_score_map_few = _to_nhw(seg_score_map_few)
+        if seg_score_map_zero.shape != seg_score_map_few.shape:
+            raise RuntimeError(
+                f"Shape mismatch before fusion: zero={seg_score_map_zero.shape}, few={seg_score_map_few.shape}"
+            )
 
         seg_score_map_zero = normalize_map_per_image(seg_score_map_zero)
         seg_score_map_few = normalize_map_per_image(seg_score_map_few)

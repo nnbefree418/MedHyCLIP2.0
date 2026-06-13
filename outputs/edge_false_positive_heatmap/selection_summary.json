@@ -1,0 +1,20 @@
+{
+  "error_mode": "boundary_false_positive",
+  "description": "Model heatmap concentrates on normal tissue edges / strong contrast structures rather than GT lesion region.",
+  "selected_dataset": "Brain",
+  "metrics": {
+    "gt_area_ratio": 0.0,
+    "misloc_ratio": 125138.5546875,
+    "edge_outside_mean": 0.3614966869354248,
+    "hot_outside_frac": 0.9999999999982639,
+    "boundary_fp_score": 226185.85937460733,
+    "index": 379,
+    "label": 0,
+    "path": "./data/Brain_AD/test/good/img/01056_97.png",
+    "is_normal": true
+  },
+  "outputs": {
+    "panel": "./outputs/edge_false_positive_heatmap/Brain/Brain_idx0379_boundary_fp_panel.png",
+    "mislocalization": "./outputs/edge_false_positive_heatmap/Brain/Brain_idx0379_boundary_fp_mislocalization.png"
+  }
+}

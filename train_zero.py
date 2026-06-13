@@ -22,12 +22,16 @@ from utils import augment, encode_text_with_prompt_ensemble, encode_text_with_hy
 from prompt import REAL_NAME                                      # 各类医学数据集的真实名称字典（用于构造文本 prompt）
 import geoopt  # 双曲几何库（用于 Hyper-MVFA）
 
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 import warnings
 warnings.filterwarnings("ignore")  # 忽略警告信息，避免日志过于冗长
 
 # 判断是否有可用的 GPU
 use_cuda = torch.cuda.is_available()
-device = torch.device("cuda:0" if use_cuda else "cpu")  # 若有 GPU，则使用第一块 GPU
+device = torch.device("cuda:0" if use_cuda else "cpu")  # 将在 main() 中被 DDP local_rank 覆盖
 
 # 类别与索引之间的映射，用于对不同数据集/任务进行编码
 CLASS_INDEX = {'Brain':3, 'Liver':2, 'Retina_RESC':1, 'Retina_OCT2017':-1, 'Chest':-2, 'Histopathology':-3}
@@ -73,8 +77,22 @@ def main():
     # ========= 新增：tag，用于区分不同实验版本的 zero-shot checkpoint =========
     parser.add_argument('--tag', type=str, default=None,
                         help='Optional tag for checkpoint naming, should match test_zero*.py')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience (epochs without improvement before stopping)')
     # ==========================================================
     args = parser.parse_args()                                                                                      # 解析参数
+
+    # ===== DDP 初始化：每个进程绑定自己的 GPU =====
+    global device
+    import datetime
+    dist.init_process_group(backend='nccl',
+                            timeout=datetime.timedelta(hours=2))  # 延长至 2h，防止大测试集 epoch-end 评估超时
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = dist.get_world_size()
+    is_main = (dist.get_rank() == 0)
+    device = torch.device(f'cuda:{local_rank}')
+    torch.cuda.set_device(device)
+    # ====================================================
 
     # ===== 自动根据是否使用双曲模式选择默认保存目录 =====
     if args.save_path is None:
@@ -104,23 +122,33 @@ def main():
     for name, param in model.named_parameters():
         param.requires_grad = True
 
+    # DDP 包裹：每张卡都有完整的模型副本，梯度自动跨卡同步
+    # find_unused_parameters=True：seg/det 分支在不同批次可能不同时激活
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    raw_model = model.module  # 始终通过 raw_model 访问 adapters（不经过 DDP 包裹）
+    if is_main:
+        print(f'[DDP] Using {world_size} GPUs')
+
     # 仅对分割与检测适配器建立优化器（即只训练 adapters）
-    seg_optimizer = torch.optim.Adam(list(model.seg_adapters.parameters()),    # 分割适配器参数
-                                     lr=args.learning_rate,                   # 学习率
-                                     betas=(0.5, 0.999))                      # Adam 的动量参数
-    det_optimizer = torch.optim.Adam(list(model.det_adapters.parameters()),    # 检测适配器参数
+    seg_optimizer = torch.optim.Adam(list(raw_model.seg_adapters.parameters()),    # 分割适配器参数
+                                     lr=args.learning_rate,                        # 学习率
+                                     betas=(0.5, 0.999))                           # Adam 的动量参数
+    det_optimizer = torch.optim.Adam(list(raw_model.det_adapters.parameters()),    # 检测适配器参数
                                      lr=args.learning_rate,
                                      betas=(0.5, 0.999))
 
     # 加载数据集和 DataLoader
     kwargs = {'num_workers': 0, 'pin_memory': True} if use_cuda else {}        # 设置为 0 避免 /tmp 空间不足问题
     train_dataset = MedTrainDataset(args.data_path, args.obj, args.img_size, args.batch_size)  # 训练集
-    train_loader = torch.utils.data.DataLoader(train_dataset,                 # 训练 DataLoader
-                                               batch_size=1,                  # 这里实际 batch_size 固定为 1
-                                               shuffle=True,                  # 打乱数据
+    # DDP：DistributedSampler 把 1640 个预批次均分给各卡，每卡处理 1640/world_size 个批次
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size,
+                                       rank=dist.get_rank(), shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                               batch_size=1,
+                                               sampler=train_sampler,         # 用 sampler 代替 shuffle=True
                                                **kwargs)
 
-    test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)    # 测试集
+    test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)    # 测试集（仅 rank 0 使用）
     test_loader = torch.utils.data.DataLoader(test_dataset,                   # 测试 DataLoader
                                               batch_size=1,                   # 测试时也按单张图像处理
                                               shuffle=False,                  # 测试集不打乱
@@ -162,35 +190,18 @@ def main():
 
     # 记录当前最优评分，用于保存最佳模型
     save_score = 0.0
+    no_improve_epochs = 0  # early stopping 计数器：记录连续未提升的 epoch 数
 
     # 训练多个 epoch
     for epoch in range(args.epoch):
-        print('epoch', epoch, ':')                                            # 打印当前 epoch
+        # DDP：通知 sampler 当前 epoch，保证不同 epoch 间的 shuffle 差异
+        train_sampler.set_epoch(epoch)
+
+        if is_main:
+            print('epoch', epoch, ':')                                        # 只由 rank 0 打印
 
         loss_list = []                                                        # 保存当前 epoch 的 batch loss
-        idx = 0                                                               # batch 计数器
-        for (image, image_label, mask, seg_idx) in tqdm(train_loader):        # 遍历训练集
-            # 每训练 len(train_loader)//5 个 batch 进行一次评估与保存检查点
-            if idx % (len(train_loader) // 5) == 0:
-                # 使用当前任务对应的文本特征进行测试
-                score = test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]], ball_list[CLASS_INDEX[args.obj]], args.temperature)
-                # 若测试得分优于历史最优，则更新最优分，并保存 checkpoint
-                if score >= save_score:
-                    save_score = score
-                    # ========= 这里加入 tag 到保存文件名 =========
-                    if args.tag is None:
-                        ckpt_name = f'{args.obj}.pth'
-                    else:
-                        ckpt_name = f'{args.obj}_{args.tag}.pth'
-                    ckp_path = os.path.join(args.save_path, ckpt_name)
-                    # =================================================
-                    torch.save({'seg_adapters': model.seg_adapters.state_dict(),   # 只保存分割适配器参数
-                                'det_adapters': model.det_adapters.state_dict()},  # 只保存检测适配器参数
-                                ckp_path)
-                    print(f'best epoch found: epoch {epoch} batch {idx}')     # 打印当前最优 epoch 和 batch
-                    print(f'saved to: {ckp_path}')
-                print('\n')
-            idx += 1                                                          # 更新 batch 计数器
+        for (image, image_label, mask, seg_idx) in tqdm(train_loader, disable=not is_main):
 
             image = image.squeeze(0).to(device)                               # 去掉 DataLoader 维度并移到 device
             seg_idx = seg_idx.item()                                         # seg_idx: 当前样本所属任务/类别索引
@@ -241,9 +252,10 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]  # [B, L]
                         # 对所有 patch 取平均，得到图像级异常分数
                         anomaly_score = torch.mean(anomaly_map, dim=-1)  # [B]
-                        # 数值保护 + 标签对齐，计算 BCE loss
-                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
-                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
+                        # 数值保护，转 fp32（BCELoss 在 autocast 块内无条件报错，需在 autocast(enabled=False) 里调用）
+                        anomaly_score = anomaly_score.float().clamp(1e-6, 1.0 - 1e-6)
+                        with torch.cuda.amp.autocast(enabled=False):
+                            det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
                     else:
                         # ===== 欧氏模式（原版 MVFA）=====
                         # L2 归一化特征，便于与文本特征做余弦相似度
@@ -254,9 +266,10 @@ def main():
                         anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                         # 对所有 patch 取平均，得到图像级异常分数，形状 [B]
                         anomaly_score = torch.mean(anomaly_map, dim=-1)
-                        # 数值保护 + 标签对齐，计算 BCE loss
-                        anomaly_score = anomaly_score.clamp(1e-6, 1.0 - 1e-6)
-                        det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
+                        # 数值保护，转 fp32
+                        anomaly_score = anomaly_score.float().clamp(1e-6, 1.0 - 1e-6)
+                        with torch.cuda.amp.autocast(enabled=False):
+                            det_loss += loss_bce(anomaly_score, image_label.float().view_as(anomaly_score))
 
                 # seg_idx > 0 表示该任务有像素级标注（如 Retina_RESC, Liver, Brain 等）
                 if seg_idx > 0:
@@ -346,19 +359,47 @@ def main():
                 # 记录当前 batch 的损失，用于 epoch 结束时统计
                 loss_list.append(loss.item())
 
-        # 每个 epoch 结束后，对训练集重新打乱（该函数内部修改数据顺序）
-        train_dataset.shuffle_dataset()
-        # 为新的数据顺序创建新的 DataLoader
-        train_loader = torch.utils.data.DataLoader(train_dataset,
-                                                   batch_size=1,
-                                                   shuffle=True,
-                                                   **kwargs)
+        # DDP：DistributedSampler 负责每 epoch 的 shuffle（通过 set_epoch），无需手动重建 DataLoader
 
-        # 打印当前 epoch 的平均训练损失
-        print("Loss: ", np.mean(loss_list))
-        
+        if is_main:
+            # 打印当前 epoch 的平均训练损失
+            print("Loss: ", np.mean(loss_list))
 
+            # ===== Early Stopping：epoch 结束时由 rank 0 做一次完整评估 =====
+            epoch_score = test(args, raw_model, test_loader,
+                               text_feature_list[CLASS_INDEX[args.obj]],
+                               ball_list[CLASS_INDEX[args.obj]],
+                               args.temperature)
+            if epoch_score >= save_score:
+                save_score = epoch_score
+                no_improve_epochs = 0
+                if args.tag is None:
+                    ckpt_name = f'{args.obj}.pth'
+                else:
+                    ckpt_name = f'{args.obj}_{args.tag}.pth'
+                ckp_path = os.path.join(args.save_path, ckpt_name)
+                torch.save({'seg_adapters': raw_model.seg_adapters.state_dict(),
+                            'det_adapters': raw_model.det_adapters.state_dict()},
+                            ckp_path)
+                print(f'[EarlyStopping] Epoch {epoch}: score improved to {round(epoch_score, 4)}, saved to {ckp_path}')
+            else:
+                no_improve_epochs += 1
+                print(f'[EarlyStopping] Epoch {epoch}: no improvement ({no_improve_epochs}/{args.patience}), best={round(save_score, 4)}')
+            # ======================================================
 
+        # 将 no_improve_epochs 从 rank 0 广播到所有进程，统一 early stopping 决策
+        stop_tensor = torch.tensor([no_improve_epochs], dtype=torch.long, device=device)
+        dist.broadcast(stop_tensor, src=0)
+        no_improve_epochs = stop_tensor.item()
+
+        if no_improve_epochs >= args.patience:
+            if is_main:
+                print(f'[EarlyStopping] Patience {args.patience} reached, stopping early at epoch {epoch}.')
+            break
+
+        dist.barrier()  # 下一 epoch 开始前所有进程同步
+
+    dist.destroy_process_group()
 
 def normalize_map_per_image(x, eps=1e-8):
     """Per-image min-max normalization over spatial dimensions (numpy array)."""

@@ -1,0 +1,14 @@
+target: his
+target_dataset: HIS
+source_datasets: [chestxray, oct17, brainmri, liverct, resc]
+image_size: 240
+backbone: ViT-L-14-336
+pretrain: openai
+allow_target_for_training: false
+allow_target_for_validation: false
+allow_target_for_prompt_adaptation: false
+allow_target_for_checkpoint_selection: false
+allow_target_for_threshold_selection: false
+metrics:
+  ac: image-level AUROC
+  as: "--"
