@@ -1,6 +1,11 @@
 MIT License
 
 Copyright (c) 2024 MediaBrain-SJTU
+Copyright (c) 2025 MedHyCLIP Contributors
+
+This project is based on the official MVFA implementation:
+"Adapting Visual-Language Models for Generalizable Anomaly Detection in Medical Images"
+(CVPR 2024 Highlight, https://arxiv.org/abs/2403.12570)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

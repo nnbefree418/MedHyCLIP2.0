@@ -73,6 +73,19 @@ tmpxc4qz_t5/
 ckpt/
 checkpoints/
 
+# Release artifacts (uploaded via GitHub Releases, not git)
+release/
+release_staging/
+
+# Logs, outputs, IDE
+logs/
+outputs/
+output-t-sne/
+.cursor/
+tools/
+benchmarks/
+external_baselines/
+
 # Other
 *.zip
 *.tar.gz

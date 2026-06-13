@@ -71,7 +71,7 @@ def main():
     parser.add_argument('--scale_abnormal', type=float, default=0.8, help='Radius scale for abnormal text embeddings')
     parser.add_argument('--temperature', type=float, default=20.0, help='Temperature for scaling hyperbolic distances to logits')
     parser.add_argument('--tag', type=str, default=None,
-                        help='Optional tag for checkpoint naming, should match train_zero_baseline.py')
+                        help='Optional tag for checkpoint naming, should match train_zero.py')
     parser.add_argument('--patience', type=int, default=10,
                         help='(unused in test, kept for CLI compatibility with train_zero.py)')
     args = parser.parse_args()  # 解析命令行参数
